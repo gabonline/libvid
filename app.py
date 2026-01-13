@@ -9,10 +9,41 @@ import sqlite3
 import hashlib
 import os
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 import uuid
 import subprocess
 import tempfile
 from PIL import Image
+import logging
+import bleach
+import re
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def sanitize_input(text, max_length=500):
+    """Sanitize user input to prevent XSS and injection attacks"""
+    if not text:
+        return ""
+    
+    # Strip leading/trailing whitespace
+    text = text.strip()
+    
+    # Limit length
+    text = text[:max_length]
+    
+    # Remove any HTML tags and dangerous characters
+    text = bleach.clean(text, tags=[], strip=True)
+    
+    # Remove any script-like patterns
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'on\w+\s*=', '', text, flags=re.IGNORECASE)
+    
+    return text
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads/videos'
@@ -23,6 +54,7 @@ app.config['ALLOWED_EXTENSIONS'] = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'm4v'}
 # Ensure upload directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['THUMBNAIL_FOLDER'], exist_ok=True)
+os.makedirs('static', exist_ok=True)
 
 def init_db():
     """Initialize the database with videos table"""
@@ -35,6 +67,8 @@ def init_db():
             artist TEXT NOT NULL,
             genre TEXT NOT NULL,
             description TEXT,
+            duration REAL,
+            file_size INTEGER,
             view_count INTEGER DEFAULT 0,
             file_name TEXT NOT NULL,
             hash TEXT NOT NULL UNIQUE,
@@ -55,6 +89,30 @@ def calculate_hash(file_path):
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
+
+def format_duration(seconds):
+    """Format duration in seconds to HH:MM:SS or MM:SS"""
+    if not seconds:
+        return "Unknown"
+    
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+def format_file_size(bytes_size):
+    """Format file size in bytes to human readable format"""
+    if not bytes_size:
+        return "Unknown"
+    
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_size < 1024.0:
+            return f"{bytes_size:.1f} {unit}"
+        bytes_size /= 1024.0
+    return f"{bytes_size:.1f} TB"
 
 def get_video_duration(video_path):
     """Get video duration in seconds using ffprobe"""
@@ -141,37 +199,76 @@ def index():
 
 @app.route('/api/videos', methods=['GET'])
 def get_videos():
-    """Get all videos with optional filtering"""
-    artist = request.args.get('artist', '')
-    genre = request.args.get('genre', '')
-    search = request.args.get('search', '')
+    """Get all videos with optional filtering and pagination"""
+    artist = sanitize_input(request.args.get('artist', ''), 100)
+    genre = sanitize_input(request.args.get('genre', ''), 100)
+    search = sanitize_input(request.args.get('search', ''), 200)
+    page = request.args.get('page', 1, type=int)
+    per_page = 36
+    
+    if page < 1:
+        page = 1
     
     conn = sqlite3.connect('video_library.db')
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     
-    query = 'SELECT * FROM videos WHERE 1=1'
+    # Build query for counting total results
+    count_query = 'SELECT COUNT(*) FROM videos WHERE 1=1'
     params = []
     
     if artist:
-        query += ' AND artist = ?'
+        count_query += ' AND artist = ?'
         params.append(artist)
     
     if genre:
-        query += ' AND genre = ?'
+        count_query += ' AND genre = ?'
         params.append(genre)
     
     if search:
-        query += ' AND (title LIKE ? OR artist LIKE ? OR description LIKE ?)'
+        count_query += ' AND (title LIKE ? OR artist LIKE ? OR description LIKE ?)'
         params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
     
-    query += ' ORDER BY id DESC'
+    # Get total count
+    c.execute(count_query, params)
+    total_count = c.fetchone()[0]
+    total_pages = (total_count + per_page - 1) // per_page  # Ceiling division
+    
+    # Build query for fetching videos
+    query = 'SELECT * FROM videos WHERE 1=1'
+    
+    if artist:
+        query += ' AND artist = ?'
+    
+    if genre:
+        query += ' AND genre = ?'
+    
+    if search:
+        query += ' AND (title LIKE ? OR artist LIKE ? OR description LIKE ?)'
+    
+    query += ' ORDER BY id DESC LIMIT ? OFFSET ?'
+    params.extend([per_page, (page - 1) * per_page])
     
     c.execute(query, params)
-    videos = [dict(row) for row in c.fetchall()]
+    videos = []
+    for row in c.fetchall():
+        video = dict(row)
+        video['duration_formatted'] = format_duration(video.get('duration'))
+        video['file_size_formatted'] = format_file_size(video.get('file_size'))
+        videos.append(video)
     conn.close()
     
-    return jsonify(videos)
+    return jsonify({
+        'videos': videos,
+        'pagination': {
+            'current_page': page,
+            'total_pages': total_pages,
+            'total_count': total_count,
+            'per_page': per_page,
+            'has_prev': page > 1,
+            'has_next': page < total_pages
+        }
+    })
 
 @app.route('/api/videos/<int:video_id>', methods=['GET'])
 def get_video(video_id):
@@ -184,7 +281,10 @@ def get_video(video_id):
     conn.close()
     
     if video:
-        return jsonify(dict(video))
+        video_dict = dict(video)
+        video_dict['duration_formatted'] = format_duration(video_dict.get('duration'))
+        video_dict['file_size_formatted'] = format_file_size(video_dict.get('file_size'))
+        return jsonify(video_dict)
     return jsonify({'error': 'Video not found'}), 404
 
 @app.route('/api/videos/<int:video_id>', methods=['DELETE'])
@@ -230,13 +330,17 @@ def delete_video(video_id):
 def update_video(video_id):
     """Update video information"""
     data = request.json
-    title = data.get('title', '').strip()
-    artist = data.get('artist', '').strip()
-    genre = data.get('genre', '').strip()
-    description = data.get('description', '').strip()
+    title = sanitize_input(data.get('title', ''), 200)
+    artist = sanitize_input(data.get('artist', ''), 100)
+    genre = sanitize_input(data.get('genre', ''), 100)
+    description = sanitize_input(data.get('description', ''), 1000)
     
-    if not all([title, artist, genre]):
-        return jsonify({'error': 'Title, artist, and genre are required'}), 400
+    if not title:
+        title = 'Unknown'
+    if not artist:
+        artist = 'Unknown'
+    if not genre:
+        genre = 'Unknown'
     
     conn = sqlite3.connect('video_library.db')
     c = conn.cursor()
@@ -293,13 +397,10 @@ def upload_video():
         return jsonify({'error': 'No video file provided'}), 400
     
     video_file = request.files['video']
-    title = request.form.get('title', '')
-    artist = request.form.get('artist', '')
-    genre = request.form.get('genre', '')
-    description = request.form.get('description', '')
-    
-    if not all([title, artist, genre]):
-        return jsonify({'error': 'Title, artist, and genre are required'}), 400
+    title = sanitize_input(request.form.get('title', ''), 200) or 'Unknown'
+    artist = sanitize_input(request.form.get('artist', ''), 100) or 'Unknown'
+    genre = sanitize_input(request.form.get('genre', ''), 100) or 'Unknown'
+    description = sanitize_input(request.form.get('description', ''), 1000)
     
     if video_file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
@@ -324,10 +425,15 @@ def upload_video():
     # Check if file with this hash already exists
     if os.path.exists(file_path):
         os.remove(temp_path)
+        logging.warning(f"Duplicate upload attempt detected. Hash: {file_hash}")
         return jsonify({'error': 'This video already exists in the library'}), 400
     
     # Move file to final location with hash-based name
     os.rename(temp_path, file_path)
+    
+    # Get video duration and file size
+    duration = get_video_duration(file_path)
+    file_size = os.path.getsize(file_path)
     
     # Generate animated GIF thumbnail
     thumbnail_filename = f"{file_hash}.gif"
@@ -344,9 +450,9 @@ def upload_video():
         conn = sqlite3.connect('video_library.db')
         c = conn.cursor()
         c.execute('''
-            INSERT INTO videos (title, artist, genre, description, file_name, hash, thumbnail_file_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (title, artist, genre, description, unique_filename, file_hash, thumbnail_filename))
+            INSERT INTO videos (title, artist, genre, description, duration, file_size, file_name, hash, thumbnail_file_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (title, artist, genre, description, duration, file_size, unique_filename, file_hash, thumbnail_filename))
         conn.commit()
         video_id = c.lastrowid
         conn.close()
@@ -357,7 +463,13 @@ def upload_video():
         os.remove(file_path)
         if thumbnail_filename and os.path.exists(thumbnail_path):
             os.remove(thumbnail_path)
+        logging.warning(f"Database duplicate detected. Hash: {file_hash}")
         return jsonify({'error': 'This video already exists in the library'}), 400
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_file(e):
+    """Handle file too large errors"""
+    return jsonify({'error': 'File is too large! Maximum size is 500MB.'}), 413
 
 @app.route('/videos/<filename>')
 def serve_video(filename):
@@ -376,6 +488,8 @@ if __name__ == '__main__':
     print("="*60)
     print("Requirements:")
     print("  - FFmpeg must be installed and available in PATH")
-    print("  - pip install flask pillow")
+    print("  - pip install flask pillow bleach")
+    print("="*60)
+    print("Server starting on http://0.0.0.0:5001")
     print("="*60)
     app.run(debug=True, host='0.0.0.0', port=5001)
