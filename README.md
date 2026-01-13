@@ -24,7 +24,7 @@ video-library/
 Or for Mac
 * brew install ffmpeg
 
-API Endpoints:  
+## API Endpoints:  
 
 GET / - Main page  
 GET /api/videos - Get videos with optional filtering (artist, genre, search)  
