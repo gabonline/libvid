@@ -197,6 +197,11 @@ def index():
     """Serve the main page"""
     return render_template('index.html')
 
+@app.route('/stats')
+def stats():
+    """Serve the statistics page"""
+    return render_template('stats.html')
+
 @app.route('/api/videos', methods=['GET'])
 def get_videos():
     """Get all videos with optional filtering and pagination"""
@@ -378,6 +383,80 @@ def get_filters():
     conn.close()
     
     return jsonify({'artists': artists, 'genres': genres})
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get library statistics"""
+    conn = sqlite3.connect('video_library.db')
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # Total statistics
+    c.execute('SELECT COUNT(*) as count, SUM(file_size) as total_size, SUM(duration) as total_duration, SUM(view_count) as total_views FROM videos')
+    totals = dict(c.fetchone())
+    
+    # Videos by genre
+    c.execute('SELECT genre, COUNT(*) as count FROM videos GROUP BY genre ORDER BY count DESC')
+    genres = [dict(row) for row in c.fetchall()]
+    
+    # Top 10 artists by video count
+    c.execute('SELECT artist, COUNT(*) as video_count FROM videos GROUP BY artist ORDER BY video_count DESC LIMIT 10')
+    top_artists = [dict(row) for row in c.fetchall()]
+    
+    # Top 10 most viewed videos
+    c.execute('SELECT id, title, artist, genre, view_count, duration, file_size FROM videos ORDER BY view_count DESC LIMIT 10')
+    top_videos = []
+    for row in c.fetchall():
+        video = dict(row)
+        video['duration_formatted'] = format_duration(video.get('duration'))
+        video['file_size_formatted'] = format_file_size(video.get('file_size'))
+        top_videos.append(video)
+    
+    # Recent uploads
+    c.execute('SELECT id, title, artist, genre, view_count, duration, file_size FROM videos ORDER BY id DESC LIMIT 10')
+    recent_videos = []
+    for row in c.fetchall():
+        video = dict(row)
+        video['duration_formatted'] = format_duration(video.get('duration'))
+        video['file_size_formatted'] = format_file_size(video.get('file_size'))
+        recent_videos.append(video)
+    
+    # Largest videos
+    c.execute('SELECT id, title, artist, genre, file_size, duration FROM videos ORDER BY file_size DESC LIMIT 10')
+    largest_videos = []
+    for row in c.fetchall():
+        video = dict(row)
+        video['duration_formatted'] = format_duration(video.get('duration'))
+        video['file_size_formatted'] = format_file_size(video.get('file_size'))
+        largest_videos.append(video)
+    
+    # Longest videos
+    c.execute('SELECT id, title, artist, genre, duration, file_size FROM videos WHERE duration IS NOT NULL ORDER BY duration DESC LIMIT 10')
+    longest_videos = []
+    for row in c.fetchall():
+        video = dict(row)
+        video['duration_formatted'] = format_duration(video.get('duration'))
+        video['file_size_formatted'] = format_file_size(video.get('file_size'))
+        longest_videos.append(video)
+    
+    conn.close()
+    
+    return jsonify({
+        'totals': {
+            'count': totals['count'] or 0,
+            'total_size': totals['total_size'] or 0,
+            'total_size_formatted': format_file_size(totals['total_size']),
+            'total_duration': totals['total_duration'] or 0,
+            'total_duration_formatted': format_duration(totals['total_duration']),
+            'total_views': totals['total_views'] or 0
+        },
+        'genres': genres,
+        'top_artists': top_artists,
+        'top_videos': top_videos,
+        'recent_videos': recent_videos,
+        'largest_videos': largest_videos,
+        'longest_videos': longest_videos
+    })
 
 @app.route('/api/videos/<int:video_id>/view', methods=['POST'])
 def increment_view(video_id):
